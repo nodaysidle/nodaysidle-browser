@@ -26,7 +26,7 @@ open nodaysidle.app
 
 `package_app.sh` sources `version.env` (`MARKETING_VERSION`, `BUILD_NUMBER`), runs `Scripts/build_icon.sh`, builds for the host arch, assembles the bundle with a generated Info.plist, and ad-hoc signs (`codesign --sign "-"`). `APP_NAME`, `BUNDLE_ID` (default `com.nodaysidle.browser`), and `MACOS_MIN_VERSION` are overridable via env vars.
 
-**v0.1 non-goals** (per README, planned v0.2+): bookmarks, history UI, extensions, sync, adblock.
+**Current non-goals** (per README): extensions, adblock, and browser-profile sync beyond the optional encrypted bookmarks/history vault.
 
 ## Architecture
 
@@ -42,6 +42,10 @@ Swift Package with executable target `nodaysidle` in `Sources/nodaysidle/` and f
 - Navigation actions (`navigateSelected`, `navigate(tabID:to:)`, `goBack`, `goForward`, `reload`, `goHome`)
 - `searchEngine` preference (persisted to `nodaysidle.searchEngine`) — `SearchEngine` enum in `Navigation.swift`: DuckDuckGo (default), Google, Brave
 - Session persistence — tab URLs/titles + selected index saved to `nodaysidle.session` (JSON in UserDefaults) on every tab/URL/selection mutation, restored in `init`
+- Bookmarks and bounded local history — stored as Codable records in UserDefaults; history is deduplicated by URL and can be cleared from the library view
+- Optional encrypted bookmarks/history sync — an authenticated CryptoKit vault in a user-selected shared folder, with the derived key kept in Keychain and local storage remaining the default
+- Tab switcher — transient title/URL filtering opened with ⌘K
+- Website data controls — WebKit's persistent default store keeps login cookies across relaunches; current-site cookies/cache/local storage can be cleared explicitly
 - Undo-close stack (`closedTabs`, max 10) — `undoCloseTab()` restores URL/title/position (⌘⇧T)
 - Lazy hydration (`hydratedTabIDs`) — gates WKWebView creation per tab
 - Find-in-page state (`findQuery`/`showFindBar`/`findTrigger`/`findMatchIndex`/`findMatchCount`) — debounced in `FindBar`, executed by `TabWebView.Coordinator.syncFindIfNeeded` via `WKWebView.find`, and counted with a read-only JS TreeWalker
@@ -62,7 +66,7 @@ ContentView (VStack)
 │   ├── Ghost buttons: Home, Back, Forward, Reload/Stop
 │   ├── AddressField — domain-only display when unfocused (Safari-style);
 │   │     TextField stays mounted so ⌘L focus always works; ESC reverts edits
-│   └── Settings Menu (website appearance status, search engine picker, About)
+│   └── Settings Menu (library, secure sync, website data/session controls, search engine picker, About)
 ├── Separator
 └── ZStack (tab content — opacity-switched, lazily hydrated)
     └── TabContentView
@@ -117,6 +121,7 @@ In `nodaysidleApp.swift` via SwiftUI `commands`:
 - `⌘T` — New Tab; `⌘W` — Close Tab (disabled on last tab); `⌘⇧T` — Reopen Closed Tab
 - `⌘⇧]` / `⌘⇧[` — Next/Previous Tab; `⌘1`–`⌘9` — jump to tab n
 - `⌘F` — Find in page (disabled on home tab)
+- `⌘K` — Search tabs
 - `⌘=` / `⌘-` / `⌘0` — Zoom in/out/reset
 
 In `ToolbarView.swift` via hidden zero-size buttons with `.keyboardShortcut` (they need access to `@FocusState`):

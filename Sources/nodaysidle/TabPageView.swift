@@ -7,7 +7,7 @@ struct TabPageView: View {
     @Bindable var store: BrowserStore
     let tabID: UUID
 
-    @State private var pendingExternalURL: URL?
+    @State private var pendingAlert: TabPageAlert?
 
     private var tab: BrowserTab? {
         store.tabs.first { $0.id == tabID }
@@ -24,7 +24,12 @@ struct TabPageView: View {
                 TabWebView(
                     tabID: tabID,
                     store: store,
-                    onExternalURL: { url in pendingExternalURL = url }
+                    onExternalURL: { url in
+                        pendingAlert = .external(url)
+                    },
+                    onMediaPermissionRequest: { request in
+                        pendingAlert = .permission(request)
+                    }
                 )
 
                 if let tab, let error = tab.navigationError {
@@ -37,19 +42,43 @@ struct TabPageView: View {
                 }
             }
         }
-        .alert("Open External Link", isPresented: Binding(
-            get: { pendingExternalURL != nil },
-            set: { if !$0 { pendingExternalURL = nil } }
-        )) {
-            Button("Open") {
-                if let url = pendingExternalURL { NSWorkspace.shared.open(url) }
-                pendingExternalURL = nil
+        .alert(item: $pendingAlert) { alert in
+            switch alert {
+            case .external(let url):
+                return Alert(
+                    title: Text("Open External Link"),
+                    message: Text("nodaysidle will open \(url.absoluteString) in another application."),
+                    primaryButton: .default(Text("Open")) {
+                        NSWorkspace.shared.open(url)
+                    },
+                    secondaryButton: .cancel(Text("Cancel"))
+                )
+            case .permission(let request):
+                return Alert(
+                    title: Text("Website Permission"),
+                    message: Text("\(request.host) wants to use your \(request.kind.label)."),
+                    primaryButton: .default(Text("Allow")) {
+                        request.decisionHandler(.grant)
+                    },
+                    secondaryButton: .cancel(Text("Deny")) {
+                        request.decisionHandler(.deny)
+                    }
+                )
             }
-            Button("Cancel", role: .cancel) { pendingExternalURL = nil }
-        } message: {
-            if let url = pendingExternalURL {
-                Text("nodaysidle will open \(url.absoluteString) in another application.")
-            }
+        }
+    }
+}
+
+private enum TabPageAlert: Identifiable {
+    case external(URL)
+    case permission(SitePermissionRequest)
+
+    var id: String {
+        switch self {
+        case .external(let url):
+            return "external:\(url.absoluteString)"
+        case .permission(let request):
+            return "permission:\(request.id.uuidString)"
         }
     }
 }
@@ -137,21 +166,14 @@ private struct FindBar: View {
 
             // Match count. WKWebView.find reports only found/not-found;
             // the coordinator runs a read-only JS TreeWalker to get the count.
-            if !store.findQuery.isEmpty {
-                if store.findMatchCount > 0 {
-                    Text("\(store.findMatchIndex) of \(store.findMatchCount)")
-                        .font(.system(size: 10, weight: .medium, design: .monospaced))
-                        .monospacedDigit()
-                        .foregroundStyle(Nodaysidle.ColorToken.muted)
-                } else if store.findMatchCount < 0, store.findMatchIndex > 0 {
-                    Text("Match found")
-                        .font(.system(size: 10, weight: .medium, design: .monospaced))
-                        .foregroundStyle(Nodaysidle.ColorToken.muted)
-                } else {
-                    Text("No matches")
-                        .font(.system(size: 10, weight: .medium, design: .monospaced))
-                        .foregroundStyle(Nodaysidle.ColorToken.danger)
-                }
+            if let status = store.findStatusText {
+                Text(status)
+                    .font(.system(size: 10, weight: .medium, design: .monospaced))
+                    .monospacedDigit()
+                    .foregroundStyle(status == "No matches" ? Nodaysidle.ColorToken.danger : Nodaysidle.ColorToken.muted)
+                    .accessibilityElement(children: .ignore)
+                    .accessibilityLabel("Find results")
+                    .accessibilityValue(status)
             }
 
             Spacer()

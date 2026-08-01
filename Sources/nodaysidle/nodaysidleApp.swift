@@ -77,6 +77,13 @@ private struct TabMenuCommands: View {
 
             Divider()
 
+            Button("Search Tabs") {
+                store.toggleTabSwitcher()
+            }
+            .keyboardShortcut("k", modifiers: [.command])
+
+            Divider()
+
             ForEach(1..<9, id: \.self) { n in
                 Button("Tab \(n)") {
                     store.selectTab(at: n - 1)

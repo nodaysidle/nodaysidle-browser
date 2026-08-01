@@ -7,9 +7,16 @@ struct TabWebView: NSViewRepresentable {
     /// Called when the user navigates to a non-web scheme (mailto:, tel:, etc.)
     /// — the wrapper shows a confirmation dialog instead of launching immediately.
     var onExternalURL: ((URL) -> Void)?
+    /// Called when a page requests camera or microphone access.
+    var onMediaPermissionRequest: ((SitePermissionRequest) -> Void)?
 
     func makeCoordinator() -> Coordinator {
-        Coordinator(tabID: tabID, store: store, onExternalURL: onExternalURL)
+        Coordinator(
+            tabID: tabID,
+            store: store,
+            onExternalURL: onExternalURL,
+            onMediaPermissionRequest: onMediaPermissionRequest
+        )
     }
 
     func makeNSView(context: Context) -> WKWebView {
@@ -37,6 +44,7 @@ struct TabWebView: NSViewRepresentable {
         context.coordinator.syncIfNeeded(webView: webView)
         context.coordinator.syncFindIfNeeded(webView: webView)
         context.coordinator.onExternalURL = onExternalURL
+        context.coordinator.onMediaPermissionRequest = onMediaPermissionRequest
     }
 
     static func dismantleNSView(_ nsView: WKWebView, coordinator: Coordinator) {
@@ -55,6 +63,7 @@ struct TabWebView: NSViewRepresentable {
         let tabID: UUID
         let store: BrowserStore
         var onExternalURL: ((URL) -> Void)?
+        var onMediaPermissionRequest: ((SitePermissionRequest) -> Void)?
         weak var webView: WKWebView?
         private var lastLoaded: URL?
         private var stateObservations: [NSKeyValueObservation] = []
@@ -63,10 +72,16 @@ struct TabWebView: NSViewRepresentable {
         private var lastFindTrigger = 0
         private var lastFindQuery = ""
 
-        init(tabID: UUID, store: BrowserStore, onExternalURL: ((URL) -> Void)?) {
+        init(
+            tabID: UUID,
+            store: BrowserStore,
+            onExternalURL: ((URL) -> Void)?,
+            onMediaPermissionRequest: ((SitePermissionRequest) -> Void)?
+        ) {
             self.tabID = tabID
             self.store = store
             self.onExternalURL = onExternalURL
+            self.onMediaPermissionRequest = onMediaPermissionRequest
         }
 
         func setupObservation(for webView: WKWebView) {
@@ -115,7 +130,7 @@ struct TabWebView: NSViewRepresentable {
             // URL — e.g. session-restored tabs. Avoids double-loading every
             // address-bar navigation.
             if webView.url != url {
-                webView.load(URLRequest(url: url))
+                webView.load(BrowserStore.navigationRequest(for: url))
             }
         }
 
@@ -229,6 +244,7 @@ struct TabWebView: NSViewRepresentable {
             lastLoaded = webView.url
             store.clearNavigationError(tabID: tabID)
             store.webViewDidUpdate(tabID: tabID, webView: webView)
+            store.recordHistory(tabID: tabID, url: webView.url, title: webView.title)
         }
 
         func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
@@ -289,6 +305,38 @@ struct TabWebView: NSViewRepresentable {
             // NSWorkspace.open or cancels.
             onExternalURL?(url)
             return .cancel
+        }
+
+        func webView(
+            _ webView: WKWebView,
+            requestMediaCapturePermissionFor origin: WKSecurityOrigin,
+            initiatedByFrame frame: WKFrameInfo,
+            type: WKMediaCaptureType,
+            decisionHandler: @escaping @MainActor @Sendable (WKPermissionDecision) -> Void
+        ) {
+            let kind: SitePermissionKind
+            switch type {
+            case .camera:
+                kind = .camera
+            case .microphone:
+                kind = .microphone
+            case .cameraAndMicrophone:
+                kind = .cameraAndMicrophone
+            @unknown default:
+                decisionHandler(.prompt)
+                return
+            }
+
+            let request = SitePermissionRequest(
+                host: origin.host,
+                kind: kind,
+                decisionHandler: decisionHandler
+            )
+            if let onMediaPermissionRequest {
+                onMediaPermissionRequest(request)
+            } else {
+                decisionHandler(.prompt)
+            }
         }
 
         func webView(

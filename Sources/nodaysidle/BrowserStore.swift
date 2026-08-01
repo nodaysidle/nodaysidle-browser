@@ -13,6 +13,16 @@ final class BrowserStore {
             userDefaults.set(searchEngine.rawValue, forKey: Self.searchEngineKey)
         }
     }
+    var bookmarks: [BrowserBookmark]
+    var history: [BrowserHistoryEntry]
+    var secureSyncFolderURL: URL?
+    var secureSyncLastSyncDate: Date?
+    var secureSyncIsSyncing = false
+    var secureSyncErrorMessage: String?
+
+    /// Transient tab switcher state. The query is never persisted.
+    var showTabSwitcher = false
+    var tabSwitcherQuery = ""
 
     /// Tabs whose WKWebView has been created. Prevents eager creation of a
     /// WKWebView for every session-restored tab — only the selected tab (and
@@ -40,9 +50,23 @@ final class BrowserStore {
 
     private static let searchEngineKey = "nodaysidle.searchEngine"
     private static let sessionKey = "nodaysidle.session"
+    private static let bookmarksKey = "nodaysidle.bookmarks"
+    private static let historyKey = "nodaysidle.history"
+    private static let deletedBookmarksKey = "nodaysidle.deletedBookmarks"
+    private static let deletedHistoryKey = "nodaysidle.deletedHistory"
+    private static let secureSyncFolderKey = "nodaysidle.secureSync.folder"
+    private static let secureSyncLastSyncKey = "nodaysidle.secureSync.lastSync"
+    private static let secureSyncDeviceIDKey = "nodaysidle.secureSync.deviceID"
+    private static let navigationTimeout: TimeInterval = 30
+    private static let maxHistoryEntries = 500
 
     private let userDefaults: UserDefaults
     private(set) var webViews: [UUID: WKWebView] = [:]
+    private var deletedBookmarkURLs: [String: Date]
+    private var deletedHistoryURLs: [String: Date]
+    private var secureSyncKeyMaterial: SecureSyncKeyMaterial?
+    private let secureSyncDeviceID: UUID
+    private var secureSyncTask: Task<Void, Never>? = nil
 
     private struct ClosedTabEntry {
         let url: URL?
@@ -58,12 +82,31 @@ final class BrowserStore {
 
     init(userDefaults: UserDefaults = .standard) {
         self.userDefaults = userDefaults
+        bookmarks = Self.restoreBookmarks(from: userDefaults)
+        history = Self.restoreHistory(from: userDefaults)
+        deletedBookmarkURLs = Self.restoreTombstones(forKey: Self.deletedBookmarksKey, from: userDefaults)
+        deletedHistoryURLs = Self.restoreTombstones(forKey: Self.deletedHistoryKey, from: userDefaults)
+        secureSyncFolderURL = Self.restoreSecureSyncFolder(from: userDefaults)
+        secureSyncLastSyncDate = userDefaults.object(forKey: Self.secureSyncLastSyncKey) as? Date
+        secureSyncKeyMaterial = try? SecureSyncKeychain.load()
+        if let rawDeviceID = userDefaults.string(forKey: Self.secureSyncDeviceIDKey),
+           let storedDeviceID = UUID(uuidString: rawDeviceID)
+        {
+            secureSyncDeviceID = storedDeviceID
+        } else {
+            let newDeviceID = UUID()
+            secureSyncDeviceID = newDeviceID
+            userDefaults.set(newDeviceID.uuidString, forKey: Self.secureSyncDeviceIDKey)
+        }
         let restored = Self.restoreSession(from: userDefaults)
         tabs = restored.tabs
         selectedTabID = restored.selectedID
         // The selected tab is hydrated immediately — visible on first render.
         tabSelectionOrder.append(restored.selectedID)
         hydratedTabIDs.insert(restored.selectedID)
+        if selectedTab?.isHome == true {
+            pendingNewTabFocusID = restored.selectedID
+        }
         if let raw = userDefaults.string(forKey: Self.searchEngineKey),
            let engine = SearchEngine(rawValue: raw)
         {
@@ -83,6 +126,66 @@ final class BrowserStore {
 
     var canUndoCloseTab: Bool {
         !closedTabs.isEmpty
+    }
+
+    var findStatusText: String? {
+        guard !findQuery.isEmpty else { return nil }
+        if findMatchCount > 0 {
+            return "\(findMatchIndex) of \(findMatchCount)"
+        }
+        if findMatchCount < 0, findMatchIndex > 0 {
+            return "Match found"
+        }
+        return "No matches"
+    }
+
+    var tabSwitcherResults: [BrowserTab] {
+        let query = tabSwitcherQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty else { return tabs }
+        return tabs.filter { tab in
+            if tab.title.localizedStandardContains(query) {
+                return true
+            }
+            return tab.url?.absoluteString.localizedStandardContains(query) == true
+        }
+    }
+
+    var selectedPageURL: URL? {
+        guard let tab = selectedTab, !tab.isHome else { return nil }
+        return Self.persistentPageURL(tab.url)
+    }
+
+    var selectedPageHost: String? {
+        selectedPageURL?.host
+    }
+
+    var canBookmarkSelectedPage: Bool {
+        selectedPageURL != nil
+    }
+
+    var isSelectedPageBookmarked: Bool {
+        guard let url = selectedPageURL else { return false }
+        return bookmarks.contains { $0.url == url }
+    }
+
+    var secureSyncIsConfigured: Bool {
+        secureSyncFolderURL != nil
+    }
+
+    var secureSyncIsUnlocked: Bool {
+        secureSyncKeyMaterial != nil
+    }
+
+    var secureSyncStatus: SecureSyncStatus {
+        if secureSyncIsSyncing { return .syncing }
+        guard secureSyncIsConfigured else { return .disabled }
+        guard secureSyncKeyMaterial != nil else { return .locked }
+        if let secureSyncErrorMessage { return .failed(secureSyncErrorMessage) }
+        return .ready
+    }
+
+    var secureSyncFolderPath: String? {
+        secureSyncFolderURL?.path
     }
 
     // MARK: - WebView registry
@@ -211,13 +314,37 @@ final class BrowserStore {
         persistSession()
     }
 
+    // MARK: - Tab switcher
+
+    func toggleTabSwitcher() {
+        if showTabSwitcher {
+            dismissTabSwitcher()
+        } else {
+            tabSwitcherQuery = ""
+            showTabSwitcher = true
+        }
+    }
+
+    func dismissTabSwitcher() {
+        showTabSwitcher = false
+        tabSwitcherQuery = ""
+    }
+
+    func selectTabFromSwitcher(_ id: UUID) {
+        selectTab(id)
+        dismissTabSwitcher()
+    }
+
     func moveTab(_ sourceID: UUID, to targetID: UUID) {
         guard let from = tabs.firstIndex(where: { $0.id == sourceID }),
-              let to = tabs.firstIndex(where: { $0.id == targetID }),
-              from != to
+              let targetIndex = tabs.firstIndex(where: { $0.id == targetID }),
+              from != targetIndex
         else { return }
         let tab = tabs.remove(at: from)
-        tabs.insert(tab, at: to)
+        // Drop-enter reorders the dragged tab immediately before the pill
+        // being entered, regardless of which direction it moves.
+        let destination = tabs.firstIndex(where: { $0.id == targetID }) ?? tabs.count
+        tabs.insert(tab, at: destination)
         persistSession()
     }
 
@@ -242,7 +369,7 @@ final class BrowserStore {
         tabs[index].isLoading = true
         tabs[index].estimatedProgress = 0.0
         tabs[index].navigationError = nil
-        webViews[tabID]?.load(URLRequest(url: url))
+        webViews[tabID]?.load(Self.navigationRequest(for: url))
         persistSession()
     }
 
@@ -253,7 +380,7 @@ final class BrowserStore {
         tabs[index].navigationError = nil
         tabs[index].isLoading = true
         tabs[index].estimatedProgress = 0.0
-        webViews[tabID]?.load(URLRequest(url: url))
+        webViews[tabID]?.load(Self.navigationRequest(for: url))
     }
 
     func reportNavigationError(tabID: UUID, message: String) {
@@ -372,6 +499,294 @@ final class BrowserStore {
         findBackwards = false
     }
 
+    // MARK: - Bookmarks and history
+
+    func toggleBookmarkForSelectedPage() {
+        guard let url = selectedPageURL,
+              let tab = selectedTab
+        else { return }
+
+        if isSelectedPageBookmarked {
+            let deletionDate = Date()
+            for bookmark in bookmarks where bookmark.url == url {
+                deletedBookmarkURLs[bookmark.url.absoluteString] = deletionDate
+            }
+            bookmarks.removeAll { $0.url == url }
+        } else {
+            deletedBookmarkURLs.removeValue(forKey: url.absoluteString)
+            bookmarks.insert(
+                BrowserBookmark(
+                    id: UUID(),
+                    title: Self.displayTitle(webTitle: tab.title, url: url),
+                    url: url,
+                    createdAt: Date()
+                ),
+                at: 0
+            )
+        }
+        persistBookmarks()
+        persistTombstones()
+        scheduleSecureSync()
+    }
+
+    func removeBookmark(_ id: UUID) {
+        let deletionDate = Date()
+        for bookmark in bookmarks where bookmark.id == id {
+            deletedBookmarkURLs[bookmark.url.absoluteString] = deletionDate
+        }
+        bookmarks.removeAll { $0.id == id }
+        persistBookmarks()
+        persistTombstones()
+        scheduleSecureSync()
+    }
+
+    func clearHistory() {
+        let deletionDate = Date()
+        for entry in history {
+            deletedHistoryURLs[entry.url.absoluteString] = deletionDate
+        }
+        history.removeAll()
+        persistHistory()
+        persistTombstones()
+        scheduleSecureSync()
+    }
+
+    /// Records a completed or client-side navigation without sending data
+    /// anywhere. Repeated visits to the same URL are kept as one recent item.
+    func recordHistory(tabID: UUID, url: URL?, title: String?) {
+        guard tabs.contains(where: { $0.id == tabID }),
+              let safeURL = Self.persistentPageURL(url)
+        else { return }
+
+        let entryTitle = Self.displayTitle(webTitle: title, url: safeURL)
+        let now = Date()
+        deletedHistoryURLs.removeValue(forKey: safeURL.absoluteString)
+        if let existingIndex = history.firstIndex(where: { $0.url == safeURL }) {
+            var existing = history.remove(at: existingIndex)
+            existing.title = entryTitle
+            existing.visitedAt = now
+            history.insert(existing, at: 0)
+        } else {
+            history.insert(
+                BrowserHistoryEntry(
+                    id: UUID(),
+                    title: entryTitle,
+                    url: safeURL,
+                    visitedAt: now
+                ),
+                at: 0
+            )
+            if history.count > Self.maxHistoryEntries {
+                history.removeLast(history.count - Self.maxHistoryEntries)
+            }
+        }
+        persistHistory()
+        persistTombstones()
+        scheduleSecureSync()
+    }
+
+    // MARK: - Secure sync
+
+    func configureSecureSync(folderURL: URL, passphrase: String) async -> SecureSyncOperationResult {
+        guard FileManager.default.fileExists(atPath: folderURL.path) else {
+            return recordSecureSyncFailure(.folderUnavailable)
+        }
+        guard !secureSyncIsSyncing else {
+            return recordSecureSyncFailure(.io("A secure sync operation is already in progress."))
+        }
+
+        secureSyncTask?.cancel()
+        secureSyncIsSyncing = true
+        secureSyncErrorMessage = nil
+        let snapshot = secureSyncSnapshot()
+        let deviceID = secureSyncDeviceID
+        let normalizedFolderURL = folderURL.standardizedFileURL
+
+        let outcome: Result<SecureSyncConfiguredVault, SecureSyncError> = await Task.detached(priority: .utility) {
+            do {
+                let configured = try SecureSyncFileStore.configureAndSynchronize(
+                    folderURL: normalizedFolderURL,
+                    passphrase: passphrase,
+                    snapshot: snapshot,
+                    deviceID: deviceID
+                )
+                return .success(
+                    SecureSyncConfiguredVault(
+                        document: configured.document,
+                        material: configured.material
+                    )
+                )
+            } catch let error as SecureSyncError {
+                return .failure(error)
+            } catch {
+                return .failure(.io("Secure sync could not be completed."))
+            }
+        }.value
+
+        secureSyncIsSyncing = false
+        switch outcome {
+        case let .success(configured):
+            do {
+                try SecureSyncKeychain.save(configured.material)
+            } catch let error as SecureSyncError {
+                return recordSecureSyncFailure(error)
+            } catch {
+                return recordSecureSyncFailure(.io("The sync key could not be saved in Keychain."))
+            }
+            secureSyncFolderURL = normalizedFolderURL
+            secureSyncKeyMaterial = configured.material
+            secureSyncErrorMessage = nil
+            persistSecureSyncSettings()
+            applySecureSyncDocument(configured.document)
+            secureSyncLastSyncDate = Date()
+            userDefaults.set(secureSyncLastSyncDate, forKey: Self.secureSyncLastSyncKey)
+            return .synced
+
+        case let .failure(error):
+            return recordSecureSyncFailure(error)
+        }
+    }
+
+    func syncSecureLibraryIfConfigured() async -> SecureSyncOperationResult {
+        guard secureSyncIsConfigured else { return .notConfigured }
+        guard secureSyncKeyMaterial != nil else { return .locked }
+        return await syncSecureLibrary()
+    }
+
+    func syncSecureLibrary() async -> SecureSyncOperationResult {
+        guard let folderURL = secureSyncFolderURL else { return .notConfigured }
+        guard let material = secureSyncKeyMaterial else { return .locked }
+        guard !secureSyncIsSyncing else {
+            return recordSecureSyncFailure(.io("A secure sync operation is already in progress."))
+        }
+
+        secureSyncIsSyncing = true
+        secureSyncErrorMessage = nil
+        let snapshot = secureSyncSnapshot()
+        let deviceID = secureSyncDeviceID
+
+        let outcome: Result<SecureSyncDocument, SecureSyncError> = await Task.detached(priority: .utility) {
+            do {
+                let document = try SecureSyncFileStore.synchronize(
+                    folderURL: folderURL,
+                    snapshot: snapshot,
+                    material: material,
+                    deviceID: deviceID
+                )
+                return .success(document)
+            } catch let error as SecureSyncError {
+                return .failure(error)
+            } catch {
+                return .failure(.io("Secure sync could not be completed."))
+            }
+        }.value
+
+        secureSyncIsSyncing = false
+        switch outcome {
+        case let .success(document):
+            applySecureSyncDocument(document)
+            secureSyncErrorMessage = nil
+            secureSyncLastSyncDate = Date()
+            userDefaults.set(secureSyncLastSyncDate, forKey: Self.secureSyncLastSyncKey)
+            return .synced
+        case let .failure(error):
+            return recordSecureSyncFailure(error)
+        }
+    }
+
+    func disableSecureSync() {
+        secureSyncTask?.cancel()
+        do {
+            try SecureSyncKeychain.remove()
+        } catch let error as SecureSyncError {
+            secureSyncErrorMessage = error.localizedDescription
+            return
+        } catch {
+            secureSyncErrorMessage = "The sync key could not be removed from Keychain."
+            return
+        }
+        secureSyncFolderURL = nil
+        secureSyncKeyMaterial = nil
+        secureSyncLastSyncDate = nil
+        secureSyncErrorMessage = nil
+        userDefaults.removeObject(forKey: Self.secureSyncFolderKey)
+        userDefaults.removeObject(forKey: Self.secureSyncLastSyncKey)
+    }
+
+    /// Clears cookies, cache, and local storage for the selected host only.
+    /// The persistent WebKit store remains enabled for all other sites.
+    func clearWebsiteDataForSelectedSite() async -> WebsiteDataClearResult {
+        guard let host = selectedPageHost else { return .noSite }
+
+        let dataStore = SiteAppearance.persistentWebsiteDataStore
+        let dataTypes = WKWebsiteDataStore.allWebsiteDataTypes()
+        let records = await dataStore.dataRecords(ofTypes: dataTypes)
+        let matchingRecords = records.filter {
+            $0.displayName.localizedCaseInsensitiveCompare(host) == .orderedSame
+        }
+        guard !matchingRecords.isEmpty else { return .noData }
+
+        await dataStore.removeData(ofTypes: dataTypes, for: matchingRecords)
+        webViews[selectedTabID]?.reload()
+        return .cleared
+    }
+
+    /// Removes the persisted tab session without closing the tabs currently
+    /// open in this process. The next launch starts with a clean home tab.
+    func clearSavedSession() {
+        userDefaults.removeObject(forKey: Self.sessionKey)
+        closedTabs.removeAll()
+    }
+
+    private func secureSyncSnapshot() -> SecureSyncSnapshot {
+        SecureSyncSnapshot(
+            bookmarks: bookmarks,
+            history: history,
+            deletedBookmarkURLs: deletedBookmarkURLs.compactMap { key, date in
+                guard let url = URL(string: key) else { return nil }
+                return SecureSyncTombstone(url: url, deletedAt: date)
+            },
+            deletedHistoryURLs: deletedHistoryURLs.compactMap { key, date in
+                guard let url = URL(string: key) else { return nil }
+                return SecureSyncTombstone(url: url, deletedAt: date)
+            }
+        )
+    }
+
+    private func applySecureSyncDocument(_ document: SecureSyncDocument) {
+        bookmarks = document.bookmarks
+        history = document.history
+        deletedBookmarkURLs = document.deletedBookmarkURLs.reduce(into: [:]) { result, tombstone in
+            result[tombstone.url.absoluteString] = tombstone.deletedAt
+        }
+        deletedHistoryURLs = document.deletedHistoryURLs.reduce(into: [:]) { result, tombstone in
+            result[tombstone.url.absoluteString] = tombstone.deletedAt
+        }
+        persistBookmarks()
+        persistHistory()
+        persistTombstones()
+    }
+
+    private func recordSecureSyncFailure(_ error: SecureSyncError) -> SecureSyncOperationResult {
+        let message = error.localizedDescription
+        secureSyncErrorMessage = message
+        return .failed(message)
+    }
+
+    private func scheduleSecureSync() {
+        guard secureSyncIsConfigured, secureSyncKeyMaterial != nil else { return }
+        secureSyncTask?.cancel()
+        secureSyncTask = Task { @MainActor [weak self] in
+            do {
+                try await Task.sleep(for: .seconds(1))
+            } catch {
+                return
+            }
+            guard !Task.isCancelled, let self else { return }
+            _ = await self.syncSecureLibrary()
+        }
+    }
+
     // MARK: - Tab mutation
 
     func updateTab(_ id: UUID, _ mutate: (inout BrowserTab) -> Void) {
@@ -418,6 +833,7 @@ final class BrowserStore {
             if tabs[index].url != url || tabs[index].title != newTitle {
                 tabs[index].url = url
                 tabs[index].title = newTitle
+                recordHistory(tabID: tabID, url: url, title: newTitle)
                 persistSession()
             }
         }
@@ -471,8 +887,95 @@ final class BrowserStore {
         }
     }
 
+    private static func restoreBookmarks(from userDefaults: UserDefaults) -> [BrowserBookmark] {
+        guard let data = userDefaults.data(forKey: bookmarksKey),
+              let saved = try? JSONDecoder().decode([BrowserBookmark].self, from: data)
+        else { return [] }
+        return saved
+    }
+
+    private static func restoreHistory(from userDefaults: UserDefaults) -> [BrowserHistoryEntry] {
+        guard let data = userDefaults.data(forKey: historyKey),
+              let saved = try? JSONDecoder().decode([BrowserHistoryEntry].self, from: data)
+        else { return [] }
+        return Array(saved.prefix(maxHistoryEntries))
+    }
+
+    private static func restoreTombstones(forKey key: String, from userDefaults: UserDefaults) -> [String: Date] {
+        guard let data = userDefaults.data(forKey: key),
+              let saved = try? JSONDecoder().decode([SecureSyncTombstone].self, from: data)
+        else { return [:] }
+        return saved.reduce(into: [:]) { result, tombstone in
+            result[tombstone.url.absoluteString] = tombstone.deletedAt
+        }
+    }
+
+    private static func restoreSecureSyncFolder(from userDefaults: UserDefaults) -> URL? {
+        guard let path = userDefaults.string(forKey: secureSyncFolderKey), !path.isEmpty else { return nil }
+        return URL(fileURLWithPath: path, isDirectory: true)
+    }
+
+    private func persistBookmarks() {
+        guard let data = try? JSONEncoder().encode(bookmarks) else { return }
+        userDefaults.set(data, forKey: Self.bookmarksKey)
+    }
+
+    private func persistHistory() {
+        guard let data = try? JSONEncoder().encode(history) else { return }
+        userDefaults.set(data, forKey: Self.historyKey)
+    }
+
+    private func persistTombstones() {
+        let bookmarks = deletedBookmarkURLs.compactMap { key, date -> SecureSyncTombstone? in
+            guard let url = URL(string: key) else { return nil }
+            return SecureSyncTombstone(url: url, deletedAt: date)
+        }
+        let history = deletedHistoryURLs.compactMap { key, date -> SecureSyncTombstone? in
+            guard let url = URL(string: key) else { return nil }
+            return SecureSyncTombstone(url: url, deletedAt: date)
+        }
+        if let bookmarkData = try? JSONEncoder().encode(bookmarks), !bookmarks.isEmpty {
+            userDefaults.set(bookmarkData, forKey: Self.deletedBookmarksKey)
+        } else {
+            userDefaults.removeObject(forKey: Self.deletedBookmarksKey)
+        }
+        if let historyData = try? JSONEncoder().encode(history), !history.isEmpty {
+            userDefaults.set(historyData, forKey: Self.deletedHistoryKey)
+        } else {
+            userDefaults.removeObject(forKey: Self.deletedHistoryKey)
+        }
+    }
+
+    private func persistSecureSyncSettings() {
+        if let secureSyncFolderURL {
+            userDefaults.set(secureSyncFolderURL.path, forKey: Self.secureSyncFolderKey)
+        } else {
+            userDefaults.removeObject(forKey: Self.secureSyncFolderKey)
+        }
+        userDefaults.set(secureSyncDeviceID.uuidString, forKey: Self.secureSyncDeviceIDKey)
+    }
+
+    private static func persistentPageURL(_ url: URL?) -> URL? {
+        guard let url,
+              let scheme = url.scheme?.lowercased(),
+              scheme == "http" || scheme == "https",
+              var components = URLComponents(url: url, resolvingAgainstBaseURL: false)
+        else { return nil }
+
+        // Never copy URL-embedded credentials into local library records.
+        components.user = nil
+        components.password = nil
+        return components.url
+    }
+
     static func displayTitle(webTitle: String?, url: URL?) -> String {
         let trimmedTitle = webTitle?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         return trimmedTitle.isEmpty ? NavigationInput.title(for: url) : trimmedTitle
+    }
+
+    static func navigationRequest(for url: URL) -> URLRequest {
+        var request = URLRequest(url: url)
+        request.timeoutInterval = navigationTimeout
+        return request
     }
 }
