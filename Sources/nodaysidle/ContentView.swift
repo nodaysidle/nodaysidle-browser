@@ -36,10 +36,28 @@ struct ContentView: View {
                         .transition(reduceMotion ? .opacity : .opacity.combined(with: .scale(scale: 0.96)))
                         .zIndex(1)
                 }
+
+                if store.showTabSwitcher {
+                    Color.black
+                        .opacity(0.32)
+                        .ignoresSafeArea()
+                        .accessibilityHidden(true)
+
+                    TabSwitcherView(store: store)
+                        .zIndex(2)
+                        .transition(reduceMotion ? .opacity : .opacity.combined(with: .scale(scale: 0.98)))
+                }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .background(Nodaysidle.ColorToken.void)
-            .animation(reduceMotion ? nil : .easeOut(duration: 0.15), value: store.zoomFeedback)
+            .animation(
+                reduceMotion ? nil : .easeOut(duration: 0.15),
+                value: store.zoomFeedback
+            )
+            .animation(
+                reduceMotion ? nil : .easeOut(duration: 0.15),
+                value: store.showTabSwitcher
+            )
             .onChange(of: store.zoomFeedback) { _, newValue in
                 guard newValue != nil else { return }
                 Task { @MainActor in
@@ -56,6 +74,9 @@ struct ContentView: View {
         .focusedSceneValue(\.canUndoCloseTab, store.canUndoCloseTab)
         .focusedSceneValue(\.tabCount, store.tabs.count)
         .focusedSceneValue(\.selectedTabIsHome, store.selectedTab?.isHome == true)
+        .task {
+            _ = await store.syncSecureLibraryIfConfigured()
+        }
     }
 }
 

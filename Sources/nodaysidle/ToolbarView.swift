@@ -4,6 +4,13 @@ struct ToolbarView: View {
     @Bindable var store: BrowserStore
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var addressText = ""
+    @State private var showingClearSessionConfirmation = false
+    @State private var librarySection: BrowserLibrarySection?
+    @State private var showingWebsiteDataConfirmation = false
+    @State private var websiteDataNotice: String?
+    @State private var isClearingWebsiteData = false
+    @State private var showingSecureSync = false
+    @State private var secureSyncNotice: String?
     @FocusState private var addressFieldFocused: Bool
 
     private var selected: BrowserTab? { store.selectedTab }
@@ -47,6 +54,7 @@ struct ToolbarView: View {
                     text: $addressText,
                     isSecure: isHTTPS,
                     isInsecure: isInsecure,
+                    securityHint: securityDescription,
                     focused: $addressFieldFocused
                 ) {
                     submitAddress()
@@ -58,7 +66,7 @@ struct ToolbarView: View {
 
                 Menu {
                     Section("Website Appearance") {
-                        Label("Follow Website", systemImage: "checkmark")
+                        Label("Follows each website", systemImage: "checkmark")
                     }
 
                     Section("Search Engine") {
@@ -68,6 +76,58 @@ struct ToolbarView: View {
                             Text("Brave").tag(SearchEngine.brave)
                         }
                         .help("Choose the default search engine for queries")
+                    }
+
+                    Section("Library") {
+                        Button(
+                            store.isSelectedPageBookmarked
+                                ? "Remove Bookmark"
+                                : "Bookmark This Page"
+                        ) {
+                            store.toggleBookmarkForSelectedPage()
+                        }
+                        .disabled(!store.canBookmarkSelectedPage)
+
+                        Button("Bookmarks…") {
+                            librarySection = .bookmarks
+                        }
+
+                        Button("History…") {
+                            librarySection = .history
+                        }
+                    }
+
+                    Section("Secure Sync") {
+                        Label(store.secureSyncStatus.label, systemImage: store.secureSyncStatus.symbolName)
+
+                        Button(
+                            store.secureSyncIsConfigured
+                                ? "Manage Secure Sync…"
+                                : "Set Up Secure Sync…"
+                        ) {
+                            showingSecureSync = true
+                        }
+
+                        if store.secureSyncIsConfigured && store.secureSyncIsUnlocked {
+                            Button("Sync Now") {
+                                syncSecureLibrary()
+                            }
+                            .disabled(store.secureSyncIsSyncing)
+                        }
+                    }
+
+                    Section("Session") {
+                        Button("Forget Saved Tabs", role: .destructive) {
+                            showingClearSessionConfirmation = true
+                        }
+                    }
+
+                    Section("Privacy") {
+                        Button(websiteDataButtonTitle, role: .destructive) {
+                            showingWebsiteDataConfirmation = true
+                        }
+                        .disabled(store.selectedPageHost == nil || isClearingWebsiteData)
+                        .help("Clear cookies, cache, and local storage for the current website")
                     }
 
                     Divider()
@@ -121,6 +181,62 @@ struct ToolbarView: View {
             .accessibilityHidden(true)
         }
         .background(Nodaysidle.ColorToken.chrome)
+        .sheet(item: $librarySection) { section in
+            BrowserLibraryView(store: store, section: section)
+        }
+        .sheet(isPresented: $showingSecureSync) {
+            SecureSyncView(store: store)
+        }
+        .confirmationDialog(
+            "Forget Saved Tabs?",
+            isPresented: $showingClearSessionConfirmation,
+            titleVisibility: .visible
+        ) {
+            Button("Forget Saved Tabs", role: .destructive) {
+                store.clearSavedSession()
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Removes saved tab URLs from this Mac. Open tabs stay open until you close them.")
+        }
+        .confirmationDialog(
+            "Clear Website Data?",
+            isPresented: $showingWebsiteDataConfirmation,
+            titleVisibility: .visible
+        ) {
+            Button("Clear Website Data", role: .destructive) {
+                clearWebsiteData()
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text(websiteDataConfirmationMessage)
+        }
+        .alert(
+            "Website Data",
+            isPresented: Binding(
+                get: { websiteDataNotice != nil },
+                set: { if !$0 { websiteDataNotice = nil } }
+            )
+        ) {
+            Button("OK", role: .cancel) {
+                websiteDataNotice = nil
+            }
+        } message: {
+            Text(websiteDataNotice ?? "")
+        }
+        .alert(
+            "Secure Sync",
+            isPresented: Binding(
+                get: { secureSyncNotice != nil },
+                set: { if !$0 { secureSyncNotice = nil } }
+            )
+        ) {
+            Button("OK", role: .cancel) {
+                secureSyncNotice = nil
+            }
+        } message: {
+            Text(secureSyncNotice ?? "")
+        }
         .onChange(of: store.selectedTabID) { _, _ in
             addressFieldFocused = false
             syncAddressFromTab()
@@ -163,6 +279,26 @@ struct ToolbarView: View {
         return scheme != "https"
     }
 
+    private var securityDescription: String {
+        if isHTTPS { return "Secure connection" }
+        if isInsecure { return "Not secure" }
+        return ""
+    }
+
+    private var websiteDataButtonTitle: String {
+        guard let host = store.selectedPageHost else {
+            return "Clear Website Data"
+        }
+        return "Clear \(host) Website Data"
+    }
+
+    private var websiteDataConfirmationMessage: String {
+        guard let host = store.selectedPageHost else {
+            return "No website is selected."
+        }
+        return "Removes cookies, cache, and local storage for \(host). This may sign you out of the website."
+    }
+
     private func syncAddressFromTab() {
         guard let tab = selected else {
             addressText = ""
@@ -182,6 +318,32 @@ struct ToolbarView: View {
             store.focusSelectedWebView()
         }
     }
+
+    private func clearWebsiteData() {
+        guard !isClearingWebsiteData else { return }
+        isClearingWebsiteData = true
+        Task { @MainActor in
+            let result = await store.clearWebsiteDataForSelectedSite()
+            isClearingWebsiteData = false
+            switch result {
+            case .noSite:
+                websiteDataNotice = "No website is selected."
+            case .noData:
+                websiteDataNotice = "No stored website data was found for this site."
+            case .cleared:
+                websiteDataNotice = "Website data was cleared. You may need to sign in again."
+            }
+        }
+    }
+
+    private func syncSecureLibrary() {
+        Task { @MainActor in
+            let result = await store.syncSecureLibrary()
+            if case let .failed(message) = result {
+                secureSyncNotice = message
+            }
+        }
+    }
 }
 
 // MARK: - Address field
@@ -190,6 +352,7 @@ private struct AddressField: View {
     @Binding var text: String
     var isSecure: Bool
     var isInsecure: Bool
+    var securityHint: String
     var focused: FocusState<Bool>.Binding
     let onCommit: () -> Void
     let onEscape: () -> Void
@@ -239,6 +402,7 @@ private struct AddressField: View {
                     .opacity(focused.wrappedValue ? 1 : 0)
                     .allowsHitTesting(focused.wrappedValue)
                     .accessibilityLabel("Address bar")
+                    .accessibilityHint(securityHint)
 
                 if !focused.wrappedValue {
                     // Display mode — domain-emphasized (host only, Safari-style)
@@ -253,7 +417,7 @@ private struct AddressField: View {
                     }
                     .buttonStyle(.plain)
                     .accessibilityLabel("Address bar — \(displayText)")
-                    .accessibilityHint("Click or press ⌘L to edit")
+                    .accessibilityHint(displayAccessibilityHint)
                 }
             }
         }
@@ -265,6 +429,13 @@ private struct AddressField: View {
                 .stroke(focused.wrappedValue ? Nodaysidle.ColorToken.accent : Nodaysidle.ColorToken.line, lineWidth: 1)
         )
         .clipShape(Capsule())
+        .help(securityHint)
+    }
+
+    private var displayAccessibilityHint: String {
+        let editHint = "Click or press ⌘L to edit"
+        guard !securityHint.isEmpty else { return editHint }
+        return "\(securityHint). \(editHint)"
     }
 
     /// Domain-only display when not editing (Safari-style).

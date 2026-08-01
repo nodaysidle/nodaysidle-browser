@@ -7,9 +7,13 @@ import WebKit
 enum SiteAppearance {
     private static let voidBackground = NSColor(red: 0.082, green: 0.082, blue: 0.088, alpha: 1)
 
+    static var persistentWebsiteDataStore: WKWebsiteDataStore {
+        .default()
+    }
+
     static func makeConfiguration() -> WKWebViewConfiguration {
         let config = WKWebViewConfiguration()
-        config.websiteDataStore = .default()
+        config.websiteDataStore = persistentWebsiteDataStore
         return config
     }
 

@@ -53,7 +53,7 @@ struct TabBarView: View {
                         value: store.tabs.map(\.id)
                     )
                 }
-                .scrollIndicators(.hidden)
+                .scrollIndicators(tabsOverflow ? .visible : .hidden)
                 .onChange(of: store.selectedTabID) { _, newID in
                     withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.15)) {
                         scrollProxy.scrollTo(newID, anchor: .center)
@@ -65,29 +65,6 @@ struct TabBarView: View {
                     Color.clear.preference(key: TabBarViewportWidthKey.self, value: geo.size.width)
                 }
             )
-            .mask {
-                if tabsOverflow {
-                    HStack(spacing: 0) {
-                        LinearGradient(
-                            colors: [.clear, .black],
-                            startPoint: .leading,
-                            endPoint: .trailing
-                        )
-                        .frame(width: 8)
-
-                        Color.black
-
-                        LinearGradient(
-                            colors: [.black, .clear],
-                            startPoint: .leading,
-                            endPoint: .trailing
-                        )
-                        .frame(width: 8)
-                    }
-                } else {
-                    Rectangle().fill(.black)
-                }
-            }
             .onPreferenceChange(TabBarContentWidthKey.self) { tabsContentWidth = $0 }
             .onPreferenceChange(TabBarViewportWidthKey.self) { tabsViewportWidth = $0 }
 
@@ -129,16 +106,14 @@ private struct TabBarViewportWidthKey: PreferenceKey {
 
 /// Reorders live while dragging: entering another pill moves the dragged tab
 /// to that position. The NSItemProvider payload is unused — `draggingTabID`
-/// carries identity.
-private struct TabDropDelegate: DropDelegate {
+/// carries identity; dropped tabs are inserted immediately before the target.
+private struct TabDropDelegate: @MainActor DropDelegate {
     let targetID: UUID
     let store: BrowserStore
 
     func dropEntered(info: DropInfo) {
-        MainActor.assumeIsolated {
-            guard let dragging = store.draggingTabID, dragging != targetID else { return }
-            store.moveTab(dragging, to: targetID)
-        }
+        guard let dragging = store.draggingTabID, dragging != targetID else { return }
+        store.moveTab(dragging, to: targetID)
     }
 
     func dropUpdated(info: DropInfo) -> DropProposal? {
@@ -146,9 +121,7 @@ private struct TabDropDelegate: DropDelegate {
     }
 
     func performDrop(info: DropInfo) -> Bool {
-        MainActor.assumeIsolated {
-            store.draggingTabID = nil
-        }
+        store.draggingTabID = nil
         return true
     }
 }
