@@ -50,6 +50,8 @@ Sync merges bookmarks and history across devices and propagates bookmark removal
 
 ## Install and run
 
+No pre-built app is published: the latest release ([v2026.7.23](https://github.com/nodaysidle/nodaysidle-browser/releases/tag/v2026.7.23)) has no downloadable assets.
+
 ### Requirements
 
 - macOS 14 or newer
